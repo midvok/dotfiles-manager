@@ -1,0 +1,2 @@
+# Force LF line endings (critical for Linux scripts and configs)
+* text=auto eol=lf

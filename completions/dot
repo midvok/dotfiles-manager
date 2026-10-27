@@ -1,0 +1,5 @@
+# Remove the system's Graphviz completion rule
+complete -r dot 2>/dev/null
+
+# Force 'dot' to use standard file/directory auto-completion
+complete -o default -A file dot

@@ -1,0 +1,979 @@
+#!/usr/bin/env bash
+#==============================================================================
+# dot - Hybrid Dotfiles Manager
+#==============================================================================
+# Description:
+#   A script for managing user configs (dotfiles) using either GNU Stow or Rsync under
+#   the hood. Each tool has its advantages; you can assign specific modules to use
+#   Rsync via the '.rsync_modules' file, while all others default to Stow.
+#
+#   1. CLI Modules -> GNU Stow (Symlinks)
+#      Plain, manually edited text configs are best handled with GNU Stow and
+#      symlinked from the ~/dotfiles repository into the \$HOME directory.
+#
+#   2. GUI Modules -> Rsync (Physical Copies)
+#      GUI apps (like KDE Plasma) write settings via atomic saves (creating a temp
+#      file, then renaming it). This silently destroys symlinks upon the first UI
+#      change and breaks the Stow workflow. For these apps, it is best to sync
+#      physical copies bi-directionally using Rsync.
+#
+# Configuration:
+# - **Exclusions**: Any top-level directory starting with `_` (e.g., `__export/`) is
+#   ignored during deployment.
+#
+# - **Methods**: A module uses Rsync if its name matches a glob pattern in
+#   `.rsync_modules`; everything else defaults to Stow (symlinks).
+#
+#------------------------------------------------------------------------------
+# Author: midvok
+# Update: 2026-09-26
+#==============================================================================
+
+# Bash Strict Mode
+# - Fail on undefined variables (-u) or piped command failures (-o pipefail)
+set -uo pipefail
+
+#------------------------------------------------------------------------------
+# HELP & USAGE
+#------------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+A dotfiles manager wrapping Stow and Rsync for file deployment via symlinks or physical copies.
+
+Usage: dot COMMAND [MODULE] [FILE] [OPTIONS]
+
+Commands:
+  list     [MODULE]     List all modules, or show file tracking status for a specific module
+  deploy   MODULE       Deploy a module to \$HOME
+  undeploy MODULE       Remove an active module from \$HOME
+  pull     MODULE       Pull live changes from \$HOME back into the repository (Rsync only)
+  add      MODULE FILE  Track a new file from \$HOME inside a module
+  remove   MODULE FILE  Stop tracking a file and restore it safely to \$HOME
+
+Options:
+  -n, --dry-run         Preview the command execution without making actual changes
+  -h, --help            Display this help message
+EOF
+}
+
+#------------------------------------------------------------------------------
+# CONSTANTS & GLOBALS
+#------------------------------------------------------------------------------
+readonly CONFIG_FILE="$HOME/.dotrc"
+readonly RSYNC_MODULES_FILE=".rsync_modules"
+readonly ORIGINAL_PWD="$PWD"
+
+# Globals for CLI arguments
+DRY_RUN=0
+ARGS=()
+
+# Globals that can be initialized from config files
+DOTFILES_DIR=""
+BACKUP_DIR=""
+IGNORE_DIRS=()
+IGNORE_FILES=()
+RSYNC_PATTERNS=()
+
+#------------------------------------------------------------------------------
+# PRINT HELPERS
+#------------------------------------------------------------------------------
+# === ANSI Escape Codes ===
+C_RST=$'\033[0m'
+C_B=$'\033[1m'
+C_I=$'\033[3m'
+C_U=$'\033[4m'
+C_DIM=$'\033[2m'
+C_REV=$'\033[7m'
+C_BLACK=$'\033[30m'
+C_RED=$'\033[31m'
+C_GREEN=$'\033[32m'
+C_YELLOW=$'\033[33m'
+C_BLUE=$'\033[34m'
+C_MAGENTA=$'\033[35m'
+C_CYAN=$'\033[36m'
+C_WHITE=$'\033[37m'
+
+# Bright Colors
+C_BBLACK=$'\033[90m'
+C_BRED=$'\033[91m'
+C_BGREEN=$'\033[92m'
+C_BYELLOW=$'\033[93m'
+C_BBLUE=$'\033[94m'
+C_BMAGENTA=$'\033[95m'
+C_BCYAN=$'\033[96m'
+C_BWHITE=$'\033[97m'
+
+# Logging printers
+log_error() { printf "%b[ERROR] %s%b\n"   "$C_RED"    "$*" "$C_RST" >&2; }
+log_warn()  { printf "%b[WARNING] %s%b\n" "$C_YELLOW" "$*" "$C_RST" >&2; }
+log_ok()    { printf "%b[SUCCESS] %s%b\n" "$C_GREEN"  "$*" "$C_RST"; }
+log_info()  { printf "%b[INFO] %s%b\n"    "$C_CYAN"   "$*" "$C_RST"; }
+
+# Prints a primary action header, automatically prepending [dry-run] if active
+log_action() {
+    local prefix=""
+    (( DRY_RUN )) && prefix="${C_CYAN}[DRY-RUN]${C_RST} "
+    printf "%b%b\n" "$prefix" "$*"
+}
+
+# print_divider [STRING] [CHAR] - Print a divider line
+# - Prints a divider matching the length of the input text (ignores ANSI).
+# - If no text is provided, prints a full-width terminal divider.
+print_divider() {
+    local input="${1:-}"
+    local char="${2:--}"
+
+    # Strip ANSI escape codes to calculate true visible length
+    local visible_text
+    visible_text=$(printf "%b" "$input" | sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g')
+    local len="${#visible_text}"
+
+    # Fallback to full terminal width if no text is provided
+    if (( len == 0 )); then
+        len=$(tput cols 2>/dev/null || echo 79)
+    fi
+
+    local spaces
+    printf -v spaces "%*s" "$len" ""
+    printf "%s\n" "${spaces// /$char}"
+}
+
+#------------------------------------------------------------------------------
+# LOAD CONFIG FILES
+#------------------------------------------------------------------------------
+load_config() {
+    # Loads user config file
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+
+    # Apply safe defaults if variables were not defined in config file
+    [[ -z "$DOTFILES_DIR" ]] && DOTFILES_DIR="$HOME/dotfiles"
+    [[ -z "$BACKUP_DIR" ]] && BACKUP_DIR="$HOME/.dotfiles-backup"
+
+    if [[ ${#IGNORE_DIRS[@]} -eq 0 ]]; then
+        IGNORE_DIRS=(
+            ".*"
+            "_*"
+        )
+    fi
+
+    if [[ ${#IGNORE_FILES[@]} -eq 0 ]]; then
+        IGNORE_FILES=(
+            "*~"
+            ".*~"
+            "*.swp"
+            "*.bak"
+            "*.orig"
+            ".directory"
+            ".DS_Store"
+            ".stowrc"
+            "README*"
+            "LICENSE*"
+        )
+    fi
+}
+
+load_rsync_patterns() {
+    RSYNC_PATTERNS=()
+
+    [[ -f "$RSYNC_MODULES_FILE" ]] || return
+
+    local patt
+    while read -r patt || [[ -n "$patt" ]]; do
+        [[ -z "$patt" || "$patt" == \#* ]] && continue
+        RSYNC_PATTERNS+=("$patt")
+    done < "$RSYNC_MODULES_FILE"
+}
+
+#------------------------------------------------------------------------------
+# HELPERS
+#------------------------------------------------------------------------------
+require_module() {
+    local module="$1"
+
+    [[ -d "$module" ]] || die "No such module: $module"
+    is_dir_module "$module" || die "Not a deployable module: $module"
+}
+
+# Return 0 (success) if the directory is a valid module, otherwise return 1
+is_dir_module() {
+    local dir="$1"
+    local patt
+
+    for patt in "${IGNORE_DIRS[@]}"; do
+        # shellcheck disable=SC2053
+        [[ "$dir" == $patt/* || "$dir" == $patt ]] && return 1
+    done
+
+    return 0
+}
+
+# Return 0 (success) if the file matches any pattern in the IGNORE_FILES array
+is_file_ignored() {
+    local file="$1"
+    local base="${file##*/}" # Extract just the filename from the path
+    local patt
+
+    for patt in "${IGNORE_FILES[@]}"; do
+        # shellcheck disable=SC2053
+        [[ "$base" == $patt ]] && return 0
+    done
+
+    return 1
+}
+
+get_method() {
+    local module="$1"
+    local patt
+
+    for patt in "${RSYNC_PATTERNS[@]}"; do
+        # shellcheck disable=SC2053
+        [[ "$module" == $patt ]] && echo "rsync" && return
+    done
+
+    echo "stow"
+}
+
+get_backup_dir() {
+    local module="$1"
+    local cmd="${2:+_$2}"
+    echo "$BACKUP_DIR/$(date +%Y-%m-%d_%H%M%S)_${module}${cmd}"
+}
+
+#------------------------------------------------------------------------------
+# CMD LIST
+# - Show every module and the deployment method it uses.
+#------------------------------------------------------------------------------
+cmd_list() {
+    {
+        printf "%b\n" "${C_U}|MODULE|METHOD ${C_RST}"
+        local name method row_clr
+        local i=1
+
+        for dir in */; do
+            # Safely handle the edge case where no directories exist
+            # and bash passes the literal pattern "*/" instead
+            [[ "$dir" == "*/" ]] && break
+
+            name="${dir%/}"
+            is_dir_module "$name" || continue
+
+            method=$(get_method "$name")
+            row_clr=""
+            [[ $method == "rsync" ]] && row_clr=${C_BLUE}
+
+            printf "${C_BBLACK}%4d${C_RST}|${row_clr}%s|%s${C_RST}\n" "$i" "$name" "$method"
+            (( i++ ))
+        done
+
+    } | column -t -s '|'
+}
+
+#------------------------------------------------------------------------------
+# CMD STATUS
+#------------------------------------------------------------------------------
+# Analyzes the status of every file tracked in a module compared to $HOME file.
+#
+# Rsync Modules:
+# - Checks if physical files are ignored, identical, modified, or not deployed
+#   (missing in $HOME).
+#
+# Stow Modules:
+# - Checks if files are symlinked, conflicted (physical file exist),
+#   or not linked.
+#------------------------------------------------------------------------------
+cmd_status() {
+    local module="$1"
+    local method
+
+    require_module "$module"
+    method=$(get_method "$module")
+
+    # Print formatted command header
+    local header=""
+    printf -v header "Status for ${C_B}%s${C_RST} module [${C_B}${C_BLUE}%s${C_RST}] " "$method" "$module"
+    printf "%s\n" "$header"
+    print_divider "$header"
+
+    # 1. Jump to the module dir
+    pushd "$module" >/dev/null || return 1
+
+    # 2. Safely gather module files (while explicitly pruning .git to save read time)
+    local files=()
+    local file
+    while IFS= read -r -d '' file; do
+        file="${file#./}" # Strip the leading './'
+        files+=("$file")
+    done < <(find . -name ".git" -prune -o -type f -print0 | sort -z)
+
+    if (( ${#files[@]} == 0 )); then
+        printf "  No files currently tracked in this module.\n"
+        popd >/dev/null || return 1
+        return 0
+    fi
+
+    # 3. List files found in module
+    {
+        local home_file status color target
+        local i=1
+        printf ""
+
+        for file in "${files[@]}"; do
+            home_file="$HOME/$file"
+
+            # Ignored files
+            if is_file_ignored "$file"; then
+                status="Ignored"
+                color="$C_BBLACK"
+
+            # Rsync evaluation logic
+            elif [[ "$method" == "rsync" ]]; then
+                if [[ ! -e "$home_file" ]]; then
+                    status="Not Deployed"
+                    color=""
+                elif cmp -s "$file" "$home_file"; then
+                    status="Identical"
+                    color="$C_GREEN"
+                elif [[ "$home_file" -nt "$file" ]]; then
+                    status="Modified, newer in HOME"
+                    color="$C_YELLOW"
+                elif [[ "$file" -nt "$home_file" ]]; then
+                    status="Modified, newer in Repo"
+                    color="$C_YELLOW"
+                else
+                    status="Unknown"
+                    color="$C_CYAN"
+                fi
+
+            # Stow evaluation logic
+            else
+                if [[ ! -e "$home_file" && ! -L "$home_file" ]]; then
+                    status="Not linked"
+                    color=""
+                elif [[ -L "$home_file" ]]; then
+                    target=$(readlink "$home_file")
+                    if [[ "$target" == *"$module"* ]]; then
+                        status="Symlinked"
+                        color="$C_GREEN"
+                    else
+                        status="Foreign Symlink"
+                        color="$C_CYAN"
+                    fi
+                else
+                    status="Physical File"
+                    color="$C_RED"
+                fi
+            fi
+
+            local filename="${file##*/}"
+            local dirpath="${file%/*}"
+            [[ "$dirpath" == "$file" ]] && dirpath="" || dirpath="${dirpath}/"
+
+            local oct date_mod
+            oct=$(stat -c "%a" "$file" 2>/dev/null);
+            date_mod=$(date -r "$file" '+%Y-%m-%d %H:%M')
+
+            printf "${C_BBLACK}%4d${C_RST}|[${color}%s${C_RST}]|%s|${C_MAGENTA}%s${C_RST}|%s${color}%s${C_RST}\n" \
+                "$i" "$status" "$oct" "$date_mod" "$dirpath" "$filename"
+
+            ((i++))
+        done
+    } | column -t -s "|"
+
+    popd >/dev/null || return 1
+}
+
+#------------------------------------------------------------------------------
+# CMD DEPLOY
+#------------------------------------------------------------------------------
+# Rsync Method (Physical Copies):
+# Command: rsync -avi [-n] [--exclude-from=-] [--backup --backup-dir=DIR] MODULE/ $HOME/
+#   -a               : Archive mode (preserves permissions, times, and structure).
+#   -v               : Verbose output, tracks exactly which files are copied.
+#   -i               : Itemize changes, outputting a detailed log of file modifications.
+#   -n               : Dry run (simulate without modifying the filesystem).
+#   --exclude-from=- : Reads the list of ignored file patterns directly from standard input.
+#   --backup         : Safely renames existing destination files instead of
+#                      blindly overwriting them.
+#   --backup-dir     : Routes those backed-up files into a timestamped folder
+#                      inside $BACKUP_ROOT.
+#
+# Stow Method (Symlinks):
+# Command: stow --no-folding -v [-n] MODULE
+#   --no-folding     : Forces individual file symlinks instead of directory symlinks.
+#                      This prevents new, untracked files created by apps from
+#                      silently landing in the git repository.
+#   -v               : Verbose output, necessary for capturing deployment logs.
+#   -n               : Dry run (simulate without modifying the filesystem).
+#------------------------------------------------------------------------------
+cmd_deploy() {
+    local module="$1"
+    local module_path
+    local method
+    local backup_dir
+    local cmd=()
+    local exit_status
+
+    require_module "$module"
+    method=$(get_method "$module")
+    module_path=$(realpath "$module")
+
+    # 1. Build the command array
+    # A. Rsync Method
+    if [[ "$method" == "rsync" ]]; then
+        cmd=(rsync -avi)
+
+        if (( DRY_RUN )); then
+            cmd+=(-n)
+        fi
+
+        # Backup any existing files before overwriting
+        backup_dir=$(get_backup_dir "$module")
+        cmd+=(--backup --backup-dir="$backup_dir")
+
+        # Rsync will read excludes from standard input
+        cmd+=(--exclude-from=-)
+
+        cmd+=("$module_path/" "$HOME/")
+
+    # B. Stow Method
+    else
+        cmd=(stow --no-folding -v)
+        (( DRY_RUN )) && cmd+=(-n)
+        cmd+=("$module")
+    fi
+
+    # 2. Print formatted command action header
+    log_action "Deploying ${C_B}${method}${C_RST} module [${C_B}${C_BLUE}${module}${C_RST}]..."
+    printf "Command: ${C_GREEN}%s${C_RST}\n" "${cmd[*]}"
+
+    # 3. Execute command and format output
+    if [[ "$method" == "rsync" ]]; then
+        # Pipe the IGNORE_FILES array into Rsync's standard input
+        printf "%s\n" "${IGNORE_FILES[@]}" | \
+            "${cmd[@]}" 2>&1 | \
+            sed -e "s/^/│  ${C_CYAN}/" -e "s/$/${C_RST}/"
+
+        # Rsync is now the 2nd command in the pipeline (index 1)
+        exit_status=${PIPESTATUS[1]}
+    else
+        "${cmd[@]}" 2>&1 | sed -e "s/^/│  ${C_CYAN}/" -e "s/$/${C_RST}/"
+
+        exit_status=${PIPESTATUS[0]}
+    fi
+
+    # 4. Evaluate exit status
+    (( DRY_RUN )) && return "$exit_status"
+
+    if (( exit_status != 0 )); then
+        log_error "Deployment failed for module: $module"
+        return "$exit_status"
+    else
+        log_ok "Deployed module: $module"
+    fi
+}
+
+#------------------------------------------------------------------------------
+# CMD UNDEPLOY
+#------------------------------------------------------------------------------
+# Reverses a deployment, removing the module's active files from $HOME.
+#
+# Rsync Method:
+# - Scans the module and moves the corresponding physical copies from $HOME
+#   to a timestamped backup directory. Missing files are gracefully ignored.
+#
+# Stow Method:
+# - Runs 'stow -D', which safely deletes the symlinks.
+#------------------------------------------------------------------------------
+cmd_undeploy() {
+    local module="$1"
+    local method
+
+    require_module "$module"
+    method=$(get_method "$module")
+
+    if [[ "$method" == "rsync" ]]; then
+        cmd_undeploy_rsync "$module"
+    else
+        cmd_undeploy_stow "$module"
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Rsync Undeploy Execution
+#------------------------------------------------------------------------------
+cmd_undeploy_rsync() {
+    local module="$1"
+    local target_dir backup_dir home_path dest_backup
+    local cmd_mv=()
+    local sep=$'\x1f'
+
+    target_dir=$(realpath "$module")
+    backup_dir=$(get_backup_dir "$module" "undeploy")
+
+    log_action "Undeploying ${C_B}rsync${C_RST} module [${C_B}${C_BLUE}${module}${C_RST}]..."
+    (
+        cd "$target_dir" || exit 1
+        local rel_path
+
+        # shellcheck disable=SC2030
+        while IFS= read -r rel_path; do
+            home_path="$HOME/$rel_path"
+
+            # 1. Symlink found: Must have been created manually or by Stow
+            if [[ -L "$home_path" ]]; then
+                printf "│  ${C_CYAN}Symlink (ignore)${sep}: ${sep}%s${C_RST}\n" "$home_path"
+
+            # 2. Physical file found
+            elif [[ -f "$home_path" ]]; then
+                dest_backup="$backup_dir/$rel_path"
+                cmd_mv=(mv "$home_path" "$dest_backup")
+
+                printf "│  ${C_GREEN}Move to backup${sep}: ${sep}%s${sep} -> %s${C_RST}\n" "$home_path" "$dest_backup"
+
+                if (( ! DRY_RUN )); then
+                    mkdir -p "$(dirname "$dest_backup")"
+                    "${cmd_mv[@]}"
+                fi
+
+            # 3. Missing: The file was already deleted or never deployed
+            else
+                printf "│  ${C_BBLACK}File not found${sep}: ${sep}%s${C_RST}\n" "$home_path"
+            fi
+
+        done < <(find . -type f | sed 's|^\./||')
+
+    ) | column -t -s "$sep" -o ""
+
+    # Capture the pipeline exit status before running anything else
+    local exit_status=${PIPESTATUS[0]}
+
+    # Evaluate exit status
+    (( DRY_RUN )) && return "$exit_status"
+
+    if (( exit_status != 0 )); then
+        log_error "Undeploy failed for module: $module"
+        return "$exit_status"
+    else
+        log_ok "Undeployed module [$module], files backed up to: $backup_dir"
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Stow Undeploy Execution
+#------------------------------------------------------------------------------
+cmd_undeploy_stow() {
+    local module="$1"
+
+    local cmd=(stow -D -v)
+    (( DRY_RUN )) && cmd+=(-n)
+    cmd+=("$module")
+
+    log_action "Undeploying ${C_B}stow${C_RST} module [${C_B}${C_BLUE}${module}${C_RST}]..."
+    printf "Command: ${C_GREEN}%s${C_RST}\n" "${cmd[*]}"
+
+    # Execute and format output
+    "${cmd[@]}" 2>&1 | sed -e "s/^/│  ${C_CYAN}/" -e "s/$/${C_RST}/"
+
+    # Capture the pipeline exit status before running anything else
+    local exit_status=${PIPESTATUS[0]}
+
+    # Evaluate exit status
+    (( DRY_RUN )) && return "$exit_status"
+
+    if (( exit_status != 0 )); then
+        log_error "Undeploy failed for module: $module"
+        return "$exit_status"
+    else
+        log_ok "Successfully undeployed module: $module"
+    fi
+}
+
+#------------------------------------------------------------------------------
+# CMD PULL
+#------------------------------------------------------------------------------
+# Method: Rsync (Physical Copies)
+# Command: rsync -avi [-n] --files-from=- $HOME/ MODULE_ABS_PATH/
+#   -a           : Archive mode (preserves permissions, times, and structure)
+#   -v,-vv       : Verbose output, -vv lists also ignored files
+#   -n           : Dry run (simulate without modifying the repository)
+#   --files-from : Reads a strict list of files from standard input (-). By
+#                  piping 'find' into this, Rsync only pulls updates for files
+#                  already tracked in the dotfiles repo, ignoring everything
+#                  else in the user's home directory.
+#------------------------------------------------------------------------------
+cmd_pull() {
+    local module="$1"
+    local method
+    local cmd=()
+    local module_path
+
+    require_module "$module"
+    method=$(get_method "$module")
+    [[ "$method" == "rsync" ]] || die "Stow modules update automatically."
+    module_path=$(realpath "$module")
+
+    # 1. Build the base command array
+    cmd=(rsync -avi)
+    (( DRY_RUN )) && cmd+=(-n)
+    cmd+=(--files-from=- "$HOME/" "$module_path/")
+
+    # 2. Print formatted command action header
+    log_action "Pulling changes from \$HOME back into the module [${C_B}${C_BLUE}${module}${C_RST}]..."
+    printf "  Command: ${C_GREEN}cd %s && find . -type f | %s${C_RST}\n" "$module_path" "${cmd[*]}"
+
+    # 3. Execute with piped input from 'find'
+    # stderr is redirected to stdout (2>&1)
+    # sed conditionally prefixes lines: Red for rsync output/errors, Cyan for normal files
+    (cd "$module_path" && find . -type f | sed 's|^\./||') | \
+        "${cmd[@]}" 2>&1 | \
+        sed -e "/^rsync/! s/^/  │  ${C_CYAN}/" \
+            -e "/^rsync/ s/^/  │  ${C_RED}/" \
+            -e "s/$/${C_RST}/"
+
+    # Capture the pipeline exit status before running anything else
+    # PIPESTATUS[1] is used here because ${cmd[@]} is the 2nd command in that pipeline
+    local exit_status=${PIPESTATUS[1]}
+
+    # 4. Evaluate exit status
+    (( DRY_RUN )) && return "$exit_status"
+
+    if (( exit_status != 0 )); then
+        log_error "Pull failed for module: $module"
+        return "$exit_status"
+    else
+        log_ok "Pulled changes for module: $module"
+    fi
+}
+
+#------------------------------------------------------------------------------
+# CMD ADD
+#------------------------------------------------------------------------------
+# Adds a file from $HOME into a tracked dotfiles module.
+#
+# Rsync Module:
+# - Copies the file into the repo, leaving the original intact.
+#   Command: mkdir -p <target_dir>
+#   Command: cp -p <src> <target>
+#
+# Stow Module:
+# - Moves the file into the repo, then symlinks it back to $HOME.
+#   Command: mv <src> <dest>
+#   Command: stow -R --no-folding <module>
+#------------------------------------------------------------------------------
+cmd_add() {
+    local module="$1"
+    local input_path="$2"
+    local method
+
+    require_module "$module"
+    method=$(get_method "$module")
+
+    # Dynamically populated by resolve_add_filepath
+    local abs_path rel_path target_path
+    resolve_add_filepath "$module" "$input_path"
+
+    if [[ "$method" == "rsync" ]]; then
+        cmd_add_rsync "$abs_path" "$rel_path" "$target_path"
+    else
+        cmd_add_stow "$module" "$abs_path" "$rel_path" "$target_path"
+    fi
+}
+
+cmd_add_rsync() {
+    local abs_path="$1" rel_path="$2" target_path="$3"
+
+    local cmd_mk=(mkdir -p "$(dirname "$target_path")")
+    local cmd_cp=(cp -p "$abs_path" "$target_path")
+
+    log_action "Adding file to Rsync module (as physical copy)..."
+    if (( DRY_RUN )); then
+        printf "  Command: ${C_GREEN}%s${C_RST}\n" "${cmd_mk[*]}"
+        printf "  Command: ${C_GREEN}%s${C_RST}\n" "${cmd_cp[*]}"
+        return 0
+    fi
+
+    "${cmd_mk[@]}" && \
+    "${cmd_cp[@]}" && \
+    log_ok "Added to module: $target_path"
+}
+
+cmd_add_stow() {
+    local module="$1" abs_path="$2" rel_path="$3" target_path="$4"
+
+    local cmd_mk=(mkdir -p "$(dirname "$target_path")")
+    local cmd_mv=(mv "$abs_path" "$target_path")
+    local cmd_stow=(stow -R --no-folding "$module")
+
+    log_action "Adding file to ${C_B}stow${C_RST} module [${C_B}${C_BLUE}${module}${C_RST}]..."
+    if (( DRY_RUN )); then
+        printf "  Command: ${C_GREEN}%s${C_RST}\n" "${cmd_mk[*]}"
+        printf "  Command: ${C_GREEN}%s${C_RST}\n" "${cmd_mv[*]}"
+        printf "  Command: ${C_GREEN}%s${C_RST}\n" "${cmd_stow[*]}"
+        return 0
+    fi
+
+    "${cmd_mk[@]}" && \
+    "${cmd_mv[@]}" && \
+    "${cmd_stow[@]}" && \
+    log_ok "Added to module and re-stowed: $target_path"
+}
+
+#------------------------------------------------------------------------------
+# Validates the input file and sets these variables in the caller's scope:
+#   abs_path    : Absolute path of the physical file
+#   rel_path    : Path relative to $HOME
+#   target_path : Target path inside the dotfiles module repo
+#------------------------------------------------------------------------------
+resolve_add_filepath() {
+    local module="$1"
+    local input_path="$2"
+    local check_path
+
+    # Make absolute path first to check for symlinks
+    [[ "$input_path" == /* ]] && check_path="$input_path" || check_path="$ORIGINAL_PWD/$input_path"
+
+    [[ -L "$check_path" ]] && die "Already a symlink, nothing to add: $input_path"
+    [[ -e "$check_path" ]] || die "File does not exist: $input_path"
+    [[ -f "$check_path" ]] || die "Not a regular file: $input_path"
+
+    # Canonicalize the path
+    abs_path=$(realpath "$check_path" 2>/dev/null) || die "No such path: $input_path"
+
+    # Enforce boundaries
+    [[ "$abs_path" == "$HOME/"* ]] || die "File not inside \$HOME: $abs_path"
+    [[ "$abs_path" == "$DOTFILES_DIR"/* ]] && die "File inside dotfiles: $abs_path"
+
+    # Calculate target paths
+    rel_path="${abs_path#"$HOME"/}"
+    target_path="$DOTFILES_DIR/$module/$rel_path"
+
+    [[ ! -e "$target_path" ]] || die "File already tracked at: $target_path"
+
+    warn_if_not_world_readable "$abs_path"
+}
+
+#------------------------------------------------------------------------------
+# Warns the user if they are adding a file with restrictive permissions (e.g., 600).
+# Git only tracks the executable bit, so locked-down files (like SSH keys or
+# API tokens) will silently become world-readable when cloned elsewhere.
+#------------------------------------------------------------------------------
+warn_if_not_world_readable() {
+    local abs_path="$1"
+    local mode mode_others
+
+    # Get the octal permission and extract the 'others' digit
+    mode=$(stat -c '%a' "$abs_path")
+    mode_others="${mode: -1}"
+
+    # Apply bitwise AND 4 (100) to isolate the read bit (rwx)
+    # (8# evaluates variable as oct number)
+    if (( (8#$mode_others & 4) == 0 )); then
+        local warning=""
+        printf -v warning "%s\n%s\n%s" "Not a world-readable file ($mode): $abs_path" \
+            "          Git cannot preserve this permission. You will need to " \
+            "          manually 'chmod $mode' this file after deploying it on another machine."
+        log_warn "$warning"
+    fi
+}
+
+#------------------------------------------------------------------------------
+# CMD REMOVE
+#------------------------------------------------------------------------------
+# Removes a file from dotfiles tracking and restores the local state.
+#
+# Rsync Module:
+#   - Deletes the file from the repo, leaving the live $HOME file untouched.
+#     Command: rm <repo_file>
+#
+# Stow Module:
+#   - Removes the symlink and moves the physical file to $HOME.
+#     Command: rm <symlink_path>
+#     Command: mv <repo_file> <symlink_path>
+#------------------------------------------------------------------------------
+cmd_remove() {
+    local module="$1"
+    local input_path="$2"
+    local method
+
+    require_module "$module"
+    method=$(get_method "$module")
+
+    # Dynamically populated by resolve_remove_filepath
+    local abs_path rel_path target_path
+    resolve_remove_filepath "$module" "$input_path" "$method"
+
+    if [[ "$method" == "rsync" ]]; then
+        cmd_remove_rsync "$module" "$abs_path" "$target_path"
+    else
+        cmd_remove_stow "$module" "$abs_path" "$target_path"
+    fi
+}
+
+cmd_remove_rsync() {
+    local module="$1" abs_path="$2" target_path="$3"
+    local cmd_rm=(rm "$target_path")
+
+    log_action "Removing file from Rsync module [${C_B}${C_BLUE}${module}${C_RST}]..."
+
+    if (( DRY_RUN )); then
+        printf "  Command: ${C_GREEN}%s${C_RST}\n" "${cmd_rm[*]}"
+        return 0
+    fi
+
+    "${cmd_rm[@]}" && \
+    log_ok "Removed from module: $target_path"
+}
+
+cmd_remove_stow() {
+    local module="$1" abs_path="$2" target_path="$3"
+
+    local cmd_rm_sym=(rm "$abs_path")
+    local cmd_mv=(mv "$target_path" "$abs_path")
+
+    log_action "Removing file from Stow module [${C_B}${C_BLUE}${module}${C_RST}]..."
+
+    if (( DRY_RUN )); then
+        printf "  Command: ${C_GREEN}%s${C_RST}\n" "${cmd_rm_sym[*]}"
+        printf "  Command: ${C_GREEN}%s${C_RST}\n" "${cmd_mv[*]}"
+        return 0
+    fi
+
+    "${cmd_rm_sym[@]}" && \
+    "${cmd_mv[@]}" && \
+    log_ok "Restored physical file to '$abs_path' and removed from repo."
+}
+
+#------------------------------------------------------------------------------
+# Validates the removal request and dynamically sets variables in the caller:
+#   abs_path    : Absolute path of the physical file or symlink in $HOME
+#   rel_path    : Path relative to $HOME
+#   target_path : Absolute path of the file inside the dotfiles module repo
+#------------------------------------------------------------------------------
+resolve_remove_filepath() {
+    local module="$1"
+    local input_path="$2"
+    local method="$3"
+    local check_path
+
+    # Absolutize the input path with preserving symlink (realpath -s)
+    [[ "$input_path" == /* ]] && check_path="$input_path" || check_path="$ORIGINAL_PWD/$input_path"
+    abs_path=$(realpath -s "$check_path" 2>/dev/null) || die "Invalid path: $input_path"
+
+    # Existence and broken symlink checks
+    if [[ ! -e "$abs_path" ]]; then
+        [[ -L "$abs_path" ]] && die "Broken symlink: $input_path"
+        die "File does not exist: $input_path"
+    fi
+
+    # $HOME Boundary Check
+    [[ "$abs_path" == "$HOME/"* ]] || die "File not inside \$HOME: $abs_path"
+
+    # Rsync method logic
+    if [[ "$method" == "rsync" ]]; then
+        [[ -L "$abs_path" ]] && die "Expected a physical file, but found a symlink: $abs_path"
+
+        rel_path="${abs_path#"$HOME"/}"
+        target_path="$DOTFILES_DIR/$module/$rel_path"
+
+        [[ -e "$target_path" ]] || die "File is not tracked in [$module]: $rel_path"
+
+    # Stow method logic
+    else
+        [[ -L "$abs_path" ]] || die "Not a symlink. Nothing to remove: $abs_path"
+
+        # Now we use standard realpath to follow the symlink to its repo target
+        target_path=$(realpath "$abs_path" 2>/dev/null) || die "Cannot resolve symlink target: $abs_path"
+
+        local module_root
+        module_root=$(realpath "$DOTFILES_DIR/$module" 2>/dev/null) || die "Cannot resolve module root: $module"
+
+        [[ "$target_path" == "$module_root/"* ]] || \
+            die "Symlink does not point into module [$module]: $abs_path -> $target_path"
+
+        rel_path="${target_path#"$module_root"/}"
+    fi
+}
+
+#------------------------------------------------------------------------------
+# ENTRY POINT
+#------------------------------------------------------------------------------
+die() {
+    log_error "$*";
+    exit 1
+}
+
+refuse_root() {
+    [[ "$EUID" -ne 0 ]] || die "Do not run 'dot' as root/sudo."
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed."
+}
+
+parse_args() {
+    DRY_RUN=0
+    ARGS=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n|--dry-run)
+                DRY_RUN=1; shift ;;
+            -h|--help)
+                usage; exit 0 ;;
+            -*) log_error "Unknown option: $1";
+                usage; exit 2 ;;
+            *)  ARGS+=("$1"); shift ;;
+        esac
+    done
+}
+
+main() {
+    # 1. Validate dependencies
+    refuse_root
+    require_command rsync
+    require_command stow
+
+    # 2. Load global config
+    load_config
+
+    # 3. Set working directory
+    cd "$DOTFILES_DIR" || die "Cannot find dotfiles directory: $DOTFILES_DIR"
+
+    # 4. Load patterns to list dirs as Rsync modules
+    load_rsync_patterns
+
+    # 5. Parse args
+    parse_args "$@"
+    local argc=${#ARGS[@]}
+    local action="${ARGS[0]:-}"
+    local module="${ARGS[1]:-}"
+    local filepath="${ARGS[2]:-}"
+
+    # 6. Run the requested command action
+    case "$action" in
+        list)
+            if (( argc == 1 )); then
+                cmd_list
+            elif (( argc == 2 )); then
+                cmd_status "$module"
+            else
+                die "Invalid arguments. Usage: dot $action [MODULE]"
+            fi ;;
+        deploy|undeploy|pull)
+            (( argc == 2 )) || die "Invalid arguments. Usage: dot $action MODULE [-n|--dry-run]"
+            "cmd_$action" "$module"
+            ;;
+        add|remove)
+            (( argc == 3 )) || die "Invalid arguments. Usage: dot $action MODULE FILE [-n|--dry-run]"
+            "cmd_$action" "$module" "$filepath"
+            ;;
+        *)  log_error "Unknown action."
+            usage
+            exit 1 ;;
+    esac
+}
+
+main "$@"
