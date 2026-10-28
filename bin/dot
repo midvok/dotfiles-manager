@@ -26,11 +26,13 @@
 #
 #------------------------------------------------------------------------------
 # Author: midvok
-# Update: 2026-09-26
+# Update: 2026-10-28
 #==============================================================================
 
-# Bash Strict Mode
-# - Fail on undefined variables (-u) or piped command failures (-o pipefail)
+# Bash strict mode:
+#   -u: treat unset variables as error and exit
+#   -o pipefail: a pipeline fails if any command in it fails
+# Note: errexit (-e) is deliberately omitted so failures can be handled explicitly
 set -uo pipefail
 
 #------------------------------------------------------------------------------
@@ -149,8 +151,20 @@ load_config() {
     fi
 
     # Apply safe defaults if variables were not defined in config file
-    [[ -z "$DOTFILES_DIR" ]] && DOTFILES_DIR="$HOME/dotfiles"
+    if [[ -z "$DOTFILES_DIR" ]]; then
+        if [[ -d "$HOME/.dotfiles" ]]; then
+            DOTFILES_DIR="$HOME/.dotfiles"
+        else
+            DOTFILES_DIR="$HOME/dotfiles"
+        fi
+    fi
     [[ -z "$BACKUP_DIR" ]] && BACKUP_DIR="$HOME/.dotfiles-backup"
+
+    # Normalize paths (expand leading '~' and strip trailing '/')
+    DOTFILES_DIR="${DOTFILES_DIR/#\~/$HOME}"
+    DOTFILES_DIR="${DOTFILES_DIR%/}"
+    BACKUP_DIR="${BACKUP_DIR/#\~/$HOME}"
+    BACKUP_DIR="${BACKUP_DIR%/}"
 
     if [[ ${#IGNORE_DIRS[@]} -eq 0 ]]; then
         IGNORE_DIRS=(
@@ -401,12 +415,13 @@ cmd_status() {
 #                      inside $BACKUP_ROOT.
 #
 # Stow Method (Symlinks):
-# Command: stow --no-folding -v [-n] MODULE
+# Command: stow --no-folding -v [-n] -t $HOME MODULE
 #   --no-folding     : Forces individual file symlinks instead of directory symlinks.
 #                      This prevents new, untracked files created by apps from
 #                      silently landing in the git repository.
 #   -v               : Verbose output, necessary for capturing deployment logs.
 #   -n               : Dry run (simulate without modifying the filesystem).
+#   -t $HOME         : Explicitly sets $HOME as the target directory.
 #------------------------------------------------------------------------------
 cmd_deploy() {
     local module="$1"
@@ -442,7 +457,7 @@ cmd_deploy() {
     else
         cmd=(stow --no-folding -v)
         (( DRY_RUN )) && cmd+=(-n)
-        cmd+=("$module")
+        cmd+=(-t "$HOME" "$module")
     fi
 
     # 2. Print formatted command action header
@@ -485,7 +500,7 @@ cmd_deploy() {
 #   to a timestamped backup directory. Missing files are gracefully ignored.
 #
 # Stow Method:
-# - Runs 'stow -D', which safely deletes the symlinks.
+# - Runs 'stow -D -t $HOME', which safely deletes the symlinks.
 #------------------------------------------------------------------------------
 cmd_undeploy() {
     local module="$1"
@@ -569,7 +584,7 @@ cmd_undeploy_stow() {
 
     local cmd=(stow -D -v)
     (( DRY_RUN )) && cmd+=(-n)
-    cmd+=("$module")
+    cmd+=(-t "$HOME" "$module")
 
     log_action "Undeploying ${C_B}stow${C_RST} module [${C_B}${C_BLUE}${module}${C_RST}]..."
     printf "Command: ${C_GREEN}%s${C_RST}\n" "${cmd[*]}"
@@ -661,7 +676,7 @@ cmd_pull() {
 # Stow Module:
 # - Moves the file into the repo, then symlinks it back to $HOME.
 #   Command: mv <src> <dest>
-#   Command: stow -R --no-folding <module>
+#   Command: stow -R --no-folding -t $HOME <module>
 #------------------------------------------------------------------------------
 cmd_add() {
     local module="$1"
@@ -705,7 +720,7 @@ cmd_add_stow() {
 
     local cmd_mk=(mkdir -p "$(dirname "$target_path")")
     local cmd_mv=(mv "$abs_path" "$target_path")
-    local cmd_stow=(stow -R --no-folding "$module")
+    local cmd_stow=(stow -R --no-folding -t "$HOME" "$module")
 
     log_action "Adding file to ${C_B}stow${C_RST} module [${C_B}${C_BLUE}${module}${C_RST}]..."
     if (( DRY_RUN )); then
