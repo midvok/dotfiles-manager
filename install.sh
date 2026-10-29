@@ -3,7 +3,7 @@
 # install.sh - Installer for dot (Hybrid Dotfiles Manager)
 #==============================================================================
 # Description:
-# - Installs, links, or removes the dot executable and its bash completion.
+# - Installs, links, or removes the 'dot' executable and its bash completion.
 # - Supports local execution from a cloned repo or remote piping via curl.
 #
 # Usage:
@@ -12,10 +12,13 @@
 #
 #------------------------------------------------------------------------------
 # Author: midvok
-# Update: 2026-10-28
+# Update: 2026-10-29
 #==============================================================================
 
-# Bash strict mode: -e (errexit) aborts immediately if any command fails
+# Bash strict mode:
+#   -e: exit immediately if a command exits with a non-zero status
+#   -u: treat unset variables as an error and exit
+#   -o pipefail: a pipeline fails if any command in it fails
 set -euo pipefail
 
 #------------------------------------------------------------------------------
@@ -39,12 +42,21 @@ EOF
 #------------------------------------------------------------------------------
 # CONSTANTS & GLOBALS
 #------------------------------------------------------------------------------
-# Use local repo path when run locally, or GitHub raw URL when run via curl
+readonly REPO_URL="https://raw.githubusercontent.com/midvok/dotfiles-manager/main"
+
+# Detect local vs remote source:
+# - Use the local source if bin/dot sits next to this install.sh script.
+# - Otherwise download from the repo URL.
+# - This also covers a standalone install.sh downloaded on its own.
+SRC_BASE="$REPO_URL"
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-    SRC_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-else
-    SRC_BASE="https://raw.githubusercontent.com/midvok/dotfiles-manager/main"
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "$script_dir/bin/dot" ]]; then
+        SRC_BASE="$script_dir"
+    fi
+    unset script_dir
 fi
+readonly SRC_BASE
 
 # Source paths
 readonly SRC_BIN="$SRC_BASE/bin/dot"
@@ -58,6 +70,9 @@ readonly TARGET_COMP="$COMP_DIR/dot"
 
 # Globals for CLI args
 INSTALL_COMP=1
+
+# Temp dir for downloads; global so the EXIT trap can still reach it
+TMP_DIR=""
 
 #------------------------------------------------------------------------------
 # HELPERS
@@ -75,17 +90,16 @@ refuse_root() {
     (( EUID != 0 )) || die "Do not run this installer as root/sudo."
 }
 
+cleanup() {
+    if [[ -n "$TMP_DIR" ]]; then
+        rm -rf "$TMP_DIR"
+    fi
+}
+
 #------------------------------------------------------------------------------
 # CHECK ENVIRONMENT
 #------------------------------------------------------------------------------
-# Verifies runtime dependencies and checks whether $BIN_DIR is active in $PATH.
-#
-# - Warns if 'rsync' or 'stow' is missing.
-# - Warns if $BIN_DIR is absent from $PATH or shadowed by another 'dot' binary.
-#------------------------------------------------------------------------------
 check_env() {
-    local resolved_dot
-
     # 1. Verify runtime dependencies
     local cmd
     for cmd in rsync stow; do
@@ -100,60 +114,70 @@ check_env() {
     fi
 
     # 3. Check if another 'dot' binary shadows ~/.local/bin/dot
-    resolved_dot="$(command -v dot 2>/dev/null || true)"
-    if [[ -n "$resolved_dot" && "$resolved_dot" != "$TARGET_BIN" ]]; then
-        warn "'dot' resolves to '$resolved_dot' instead of '$TARGET_BIN'."
+    local resolved
+    resolved="$(command -v dot 2>/dev/null || true)"
+    if [[ -n "$resolved" && "$resolved" != "$TARGET_BIN" ]]; then
+        warn "'dot' resolves to '$resolved' instead of '$TARGET_BIN'."
         printf "  Place '%s' before '%s' in your \$PATH.\n" \
-            "$BIN_DIR" "$(dirname "$resolved_dot")"
+            "$BIN_DIR" "$(dirname "$resolved")"
     fi
 }
 
 #------------------------------------------------------------------------------
-# INSTALL COPY
+# INSTALL FILE
 #------------------------------------------------------------------------------
-# Installs 'dot' by copying local repository files or downloading via curl.
+# Installs SRC into DEST with permissions MODE, creating any missing parent
+# directories.
 #
-# - Copies $SRC_BIN and $SRC_COMP when run from a local clone.
-# - Fetches $SRC_BIN and $SRC_COMP via curl when piped remotely.
+# - Remote sources (URLs) are downloaded into $TMP_DIR and syntax-checked with
+#   'bash -n' before install, so a failed download never replaces a working
+#   file.
+# - 'install' unlinks an existing DEST first, so an old symlink is replaced
+#   rather than followed.
 #------------------------------------------------------------------------------
-install_copy() {
-    # 1. Create target directories
-    mkdir -p "$BIN_DIR"
-    if (( INSTALL_COMP )); then
-        mkdir -p "$COMP_DIR"
+install_file() {
+    local src="$1" dest="$2" mode="$3"
+
+    # Download and validate remote source if given a URL
+    if [[ "$src" == https://* ]]; then
+        local tmp
+        tmp="$(mktemp "$TMP_DIR/download.XXXXXX")"
+        curl -fsSL "$src" -o "$tmp" || die "Download failed: $src"
+        bash -n "$tmp" || die "Downloaded file is not valid Bash: $src"
+        src="$tmp"
     fi
 
-    # 2. Copy from local clone or download from GitHub
-    if [[ -f "$SRC_BIN" ]]; then
-        cp -f "$SRC_BIN" "$TARGET_BIN"
-        chmod +x "$TARGET_BIN"
-        if (( INSTALL_COMP )); then
-            cp -f "$SRC_COMP" "$TARGET_COMP"
-        fi
-    else
+    # Install file with specified mode, creating parent directories as needed
+    install -D -m "$mode" "$src" "$dest"
+}
+
+#------------------------------------------------------------------------------
+# INSTALL AS COPY
+#------------------------------------------------------------------------------
+install_as_copy() {
+    # 1. Remote installs need curl
+    if [[ "$SRC_BIN" == https://* ]]; then
         command -v curl >/dev/null 2>&1 || \
             die "'curl' is required for remote installation."
-        curl -fsSL "$SRC_BIN" -o "$TARGET_BIN"
-        chmod +x "$TARGET_BIN"
-        if (( INSTALL_COMP )); then
-            curl -fsSL "$SRC_COMP" -o "$TARGET_COMP"
-        fi
     fi
 
-    # 3. Report status and validate environment
+    # 2. Install files
+    install_file "$SRC_BIN" "$TARGET_BIN" 755
     printf "Installed: %s\n" "$TARGET_BIN"
+
     if (( INSTALL_COMP )); then
+        install_file "$SRC_COMP" "$TARGET_COMP" 644
         printf "Installed: %s\n" "$TARGET_COMP"
     fi
+
+    # 3. Validate environment
     check_env
 }
 
 #------------------------------------------------------------------------------
-# INSTALL LINK
+# INSTALL AS LINK
 #------------------------------------------------------------------------------
-# Symlinks repository files into ~/.local for live development.
-#------------------------------------------------------------------------------
-install_link() {
+install_as_link() {
     [[ -f "$SRC_BIN" ]] || \
         die "Option --link must be run from a local repository clone."
 
@@ -178,8 +202,6 @@ install_link() {
 
 #------------------------------------------------------------------------------
 # UNINSTALL
-#------------------------------------------------------------------------------
-# Removes installed 'dot' binary and completion files (physical or symlinked).
 #------------------------------------------------------------------------------
 uninstall() {
     local removed=0
@@ -221,9 +243,12 @@ main() {
         esac
     done
 
+    TMP_DIR="$(mktemp -d)"
+    trap cleanup EXIT
+
     case "$mode" in
-        copy)   install_copy ;;
-        link)   install_link ;;
+        copy)   install_as_copy ;;
+        link)   install_as_link ;;
         remove) uninstall ;;
     esac
 }
